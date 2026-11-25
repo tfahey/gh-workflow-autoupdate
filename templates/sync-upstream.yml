@@ -1,0 +1,75 @@
+name: Sync from upstream
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: owner/public-repo   # <-- set to the public repo you imported from
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
+  CONFLICT_BRANCH: upstream-sync     # used only when the merge has conflicts
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          # A PAT with `repo` + `workflow` scopes is required if upstream ever
+          # changes files under .github/workflows/. Falls back to GITHUB_TOKEN.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+      - name: Merge and push
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          UPSTREAM_REF="upstream/${UPSTREAM_BRANCH}"
+
+          if git merge-base --is-ancestor "$UPSTREAM_REF" HEAD; then
+            echo "Already up to date with ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}."
+            exit 0
+          fi
+
+          if git merge --no-edit "$UPSTREAM_REF" -m "Merge ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} into ${TARGET_BRANCH}"; then
+            git push origin "HEAD:${TARGET_BRANCH}"
+            echo "Merged and pushed $(git rev-parse --short "$UPSTREAM_REF")." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Conflicts: don't touch TARGET_BRANCH. Push upstream to a side branch
+          # and open (or update) a PR so the conflicts can be resolved by hand.
+          git merge --abort
+          git push --force origin "${UPSTREAM_REF}:refs/heads/${CONFLICT_BRANCH}"
+
+          if [ "$(gh pr list --head "$CONFLICT_BRANCH" --base "$TARGET_BRANCH" --state open --json number --jq length)" = "0" ]; then
+            gh pr create \
+              --head "$CONFLICT_BRANCH" \
+              --base "$TARGET_BRANCH" \
+              --title "Sync from upstream ${UPSTREAM_REPO} (merge conflicts)" \
+              --body "Automatic merge of \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\` failed due to conflicts. Resolve them in this PR (or locally with \`sync-upstream.sh\`) and merge."
+          fi
+
+          echo "::warning::Merge conflicts; opened/updated PR from ${CONFLICT_BRANCH}."
+          echo "Merge conflicts — see the open PR from \`${CONFLICT_BRANCH}\`." >> "$GITHUB_STEP_SUMMARY"
